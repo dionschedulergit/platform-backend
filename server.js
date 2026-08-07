@@ -31,11 +31,28 @@ const PLAN_PRICE_IDS = {
 };
 
 const app = express();
-app.use(cors());
+
+// Railway sits in front of this app as a reverse proxy — without this,
+// every request looks like it comes from Railway's own internal IP,
+// which would break both the rate limiter below and any per-IP logic.
+app.set("trust proxy", true);
+
+// Only the real frontend (and local dev) can call this API from a
+// browser. This doesn't stop a direct curl/script request (nothing
+// server-side truly can), but it closes off the easiest attack — some
+// other website silently firing requests at this API from a visitor's
+// browser — and it's free to add.
+const ALLOWED_ORIGINS = [
+  process.env.PLATFORM_URL || "https://dionscheduler.com",
+  "http://localhost:5173",
+  "http://localhost:3000",
+];
+app.use(cors({ origin: ALLOWED_ORIGINS }));
 
 // ── WEBHOOKS ──────────────────────────────────────────────────────────
-// Registered before express.json() — Stripe webhook signature
-// verification needs the raw, unparsed request body.
+// Registered before express.json() and before the rate limiter — Stripe
+// webhook signature verification needs the raw, unparsed request body,
+// and Stripe's own retry bursts shouldn't get throttled.
 
 // Fires when a connected business's account status changes — e.g. once
 // they finish onboarding and can actually accept payments.
@@ -103,13 +120,89 @@ app.post("/webhooks/billing", express.raw({ type: "application/json" }), async (
 
 app.use(express.json());
 
+// ── LIGHTWEIGHT RATE LIMITING ───────────────────────────────────────
+// A simple in-memory, per-IP sliding window — no extra dependency to
+// install, no extra infrastructure to run. It won't stop a determined,
+// distributed attacker, but it blunts casual brute-forcing and spam
+// against a single Railway instance. (If this backend ever runs on
+// multiple instances at once, swap this for a shared store like Redis
+// — an in-memory counter only sees traffic that hits that one instance.)
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX = 60; // requests per IP per minute
+const rateLimitHits = new Map(); // ip -> [timestamps]
+
+function rateLimit(req, res, next) {
+  const ip = req.ip || "unknown";
+  const now = Date.now();
+  const hits = (rateLimitHits.get(ip) || []).filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+  hits.push(now);
+  rateLimitHits.set(ip, hits);
+  if (hits.length > RATE_LIMIT_MAX) {
+    return res.status(429).json({ error: "Too many requests — please slow down and try again shortly." });
+  }
+  next();
+}
+// Keep the map from growing forever with IPs that stopped sending requests.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, hits] of rateLimitHits) {
+    const fresh = hits.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length === 0) rateLimitHits.delete(ip);
+    else rateLimitHits.set(ip, fresh);
+  }
+}, RATE_LIMIT_WINDOW_MS).unref();
+
+app.use(rateLimit);
+
+// ── AUTH: verify the caller actually owns this business ────────────────
+// businessId is NOT a secret — it's visible in the browser on every
+// business's public booking page (/book/:slug), so "the request includes
+// a valid businessId" proves nothing on its own. Every endpoint that can
+// view/change a business's Stripe Connect account, issue a refund, or
+// touch their platform subscription requires the caller to send a real,
+// currently-valid Supabase login session for THAT business's owner —
+// verified here against Supabase's own auth server, not just decoded.
+async function getVerifiedBusiness(req, res, businessId) {
+  if (!businessId) {
+    res.status(400).json({ error: "businessId is required" });
+    return null;
+  }
+
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: "You must be logged in to do this." });
+    return null;
+  }
+
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+  if (authError || !user) {
+    res.status(401).json({ error: "Your session has expired — please log in again." });
+    return null;
+  }
+
+  const { data: business, error: bizError } = await supabase.from("businesses").select("*").eq("id", businessId).single();
+  if (bizError || !business) {
+    res.status(404).json({ error: "Business not found" });
+    return null;
+  }
+
+  if (business.auth_user_id !== user.id) {
+    res.status(403).json({ error: "You don't have permission to manage this business." });
+    return null;
+  }
+
+  return business;
+}
+
 // ── STRIPE CONNECT: onboarding ───────────────────────────────────────
 // Call this when a business owner clicks "Connect Stripe" in Settings.
+// Owner-only — requires a valid login session for this business.
 app.post("/connect/onboard", async (req, res) => {
   try {
     const { businessId } = req.body;
-    const { data: business, error } = await supabase.from("businesses").select("*").eq("id", businessId).single();
-    if (error || !business) return res.status(404).json({ error: "Business not found" });
+    const business = await getVerifiedBusiness(req, res, businessId);
+    if (!business) return;
 
     let accountId = business.stripe_connect_account_id;
 
@@ -139,13 +232,15 @@ app.post("/connect/onboard", async (req, res) => {
 
 // Check onboarding status directly (in addition to the webhook) —
 // useful right after the owner returns from Stripe's onboarding flow.
+// Owner-only — requires a valid login session for this business.
 app.get("/connect/status/:businessId", async (req, res) => {
   try {
-    const { data: business } = await supabase.from("businesses").select("stripe_connect_account_id").eq("id", req.params.businessId).single();
-    if (!business?.stripe_connect_account_id) return res.json({ connected: false, chargesEnabled: false });
+    const business = await getVerifiedBusiness(req, res, req.params.businessId);
+    if (!business) return;
+    if (!business.stripe_connect_account_id) return res.json({ connected: false, chargesEnabled: false });
 
     const account = await stripe.accounts.retrieve(business.stripe_connect_account_id);
-    await supabase.from("businesses").update({ stripe_connect_charges_enabled: !!account.charges_enabled }).eq("id", req.params.businessId);
+    await supabase.from("businesses").update({ stripe_connect_charges_enabled: !!account.charges_enabled }).eq("id", business.id);
 
     res.json({ connected: true, chargesEnabled: !!account.charges_enabled });
   } catch (err) {
@@ -155,6 +250,13 @@ app.get("/connect/status/:businessId", async (req, res) => {
 });
 
 // ── CLIENT PAYMENTS (deposits, checkout) — money goes to the BUSINESS ──
+// Deliberately left open, no login required — customers booking a
+// deposit are never logged in. This only ever creates a Stripe
+// PaymentIntent (nothing is charged until a real card is entered and
+// confirmed with Stripe directly), so the worst case of someone abusing
+// this endpoint on its own is unused PaymentIntents cluttering a
+// business's Stripe dashboard — the rate limiter above keeps that cheap
+// to ignore.
 app.post("/client-payment-intent", async (req, res) => {
   try {
     const { businessId, amountCents, metadata = {} } = req.body;
@@ -183,11 +285,15 @@ app.post("/client-payment-intent", async (req, res) => {
   }
 });
 
+// Issuing a refund undoes a real charge — this is a business decision,
+// not something a customer should be able to trigger on themselves.
+// Owner-only — requires a valid login session for this business.
 app.post("/client-refund", async (req, res) => {
   try {
     const { businessId, paymentIntentId } = req.body;
-    const { data: business } = await supabase.from("businesses").select("stripe_connect_account_id").eq("id", businessId).single();
-    if (!business?.stripe_connect_account_id) return res.status(404).json({ error: "Business not found" });
+    const business = await getVerifiedBusiness(req, res, businessId);
+    if (!business) return;
+    if (!business.stripe_connect_account_id) return res.status(404).json({ error: "Business not found" });
 
     const refund = await stripe.refunds.create({ payment_intent: paymentIntentId }, { stripeAccount: business.stripe_connect_account_id });
     res.json(refund);
@@ -198,14 +304,15 @@ app.post("/client-refund", async (req, res) => {
 });
 
 // ── PLATFORM SUBSCRIPTION (Stripe Billing) — money goes to YOU ────────
+// Owner-only — requires a valid login session for this business.
 app.post("/subscription/checkout", async (req, res) => {
   try {
     const { businessId, plan } = req.body;
     const priceId = PLAN_PRICE_IDS[plan];
     if (!priceId) return res.status(400).json({ error: "Unknown plan" });
 
-    const { data: business, error } = await supabase.from("businesses").select("*").eq("id", businessId).single();
-    if (error || !business) return res.status(404).json({ error: "Business not found" });
+    const business = await getVerifiedBusiness(req, res, businessId);
+    if (!business) return;
 
     let customerId = business.stripe_customer_id;
     if (!customerId) {
@@ -231,12 +338,16 @@ app.post("/subscription/checkout", async (req, res) => {
 });
 
 // Lets a business owner manage/cancel their own subscription without
-// you building a custom UI for it — Stripe hosts this page.
+// you building a custom UI for it — Stripe hosts this page. This is the
+// single most sensitive endpoint in this file (a working link straight
+// into a business's real billing portal), so it's owner-only — requires
+// a valid login session for this business.
 app.post("/subscription/portal", async (req, res) => {
   try {
     const { businessId } = req.body;
-    const { data: business } = await supabase.from("businesses").select("stripe_customer_id").eq("id", businessId).single();
-    if (!business?.stripe_customer_id) return res.status(400).json({ error: "No subscription on file yet" });
+    const business = await getVerifiedBusiness(req, res, businessId);
+    if (!business) return;
+    if (!business.stripe_customer_id) return res.status(400).json({ error: "No subscription on file yet" });
 
     const session = await stripe.billingPortal.sessions.create({
       customer: business.stripe_customer_id,
